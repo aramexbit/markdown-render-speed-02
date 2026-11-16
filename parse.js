@@ -378,6 +378,16 @@ function htmlBlockType(cur) {
     if (m >= n) return BLOCK_TAGS.has(name) ? 6 : 7;
     return 0;
   }
+  // type 1: pre, script, style, textarea (open tag only; the closing
+  // tag branch returned above).  Ends at the matching closing tag,
+  // and may span blank lines.
+  if (name === 'pre' || name === 'script' || name === 'style' || name === 'textarea') {
+    if (k >= n) return 1;
+    const c = s.charCodeAt(k);
+    if (c === 32 || c === 9 || c === 62) return 1;
+    if (c === 47 && k + 1 < n && s.charCodeAt(k + 1) === 62) return 1;
+    return 0;
+  }
   // open tag: type 6 when the name is a block tag and what follows the name
   // is a space, tab, '>', '/>' or end of line (loose rule); type 7 otherwise.
   if (BLOCK_TAGS.has(name)) {
@@ -1053,6 +1063,8 @@ function parseBlocks(src) {
         if (tip.t === B_PARA && !curIsBlank(cur) && !lineStartsBlockAt(cur)) {
           lazy = true;
         } else {
+          // a blank line after an html block removes its trailing newline
+          if ((rawBlank || curIsBlank(cur)) && tip.t === B_HTML) tip.htmlAddNL = false;
           const l = closeTo(container);
           if (l) return { leftovers: l, retry: true };
         }
@@ -1066,6 +1078,12 @@ function parseBlocks(src) {
 
     // ---- blank line
     if (blank) {
+      // html blocks of types 1-5 continue across blank lines (they end
+      // only at their closing sequence); the blank line joins the block
+      if (tip.t === B_HTML && tip.hType >= 1 && tip.hType <= 5) {
+        tip.lines.push(curRest(cur));
+        return null;
+      }
       // cm-241: a container-blank line (blank after a marker, raw not blank)
       // joins the paragraph when the tip is a paragraph in that blockquote
       // and the next line does not continue the blockquote.
@@ -1311,7 +1329,11 @@ function parseBlocks(src) {
     if (tip.t === B_HTML) {
       tip.lines.push(curRest(cur));
       if (tip.hType !== 7 && tip.hType !== 6 && htmlBlockEnds(tip.hType, curRest(cur), tip.htmlName)) {
-        tip.htmlAddNL = item.term;
+        // trailing newline only when this line was terminated and the
+        // next line is not blank (cm-183)
+        const nextLine = qi + 1 < queue.length ? queue[qi + 1].s : null;
+        tip.htmlAddNL = item.term && !(nextLine !== null && rawIsBlank(nextLine));
+        finalize(tip);
         tip = tip.parent;
       }
       return null;
