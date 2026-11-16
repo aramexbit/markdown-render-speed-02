@@ -338,7 +338,11 @@ function parseHtmlTag(s, i) {
         j = e;
       }
     } else {
-      j = m;
+      // valueless attribute: leave `j` at the end of the attribute
+      // name so the next loop iteration sees the whitespace before
+      // the following attribute (cm-616: `_boolean zoop:33=...` —
+      // advancing `j` past the space made `zoop` look like an
+      // attribute without preceding whitespace)
     }
   }
 }
@@ -1698,7 +1702,10 @@ function textNode(s) { return { t: 'text', s }; }
 function addTextTo(out, s) {
   if (!s) return;
   const last = out[out.length - 1];
-  if (last && last.t === 'text' && !last.delim && !last.bracket) last.s += s;
+  // never merge into a delimiter/bracket/escape node: an escape-resolved
+  // char must stay its own node so it cannot join an adjacent word into
+  // a false autolink (cm-606: `\+` in `<foo\+@bar.example.com>`)
+  if (last && last.t === 'text' && !last.delim && !last.bracket && !last.esc) last.s += s;
   else out.push(textNode(s));
 }
 /* Plain-text content of inline nodes (for image alt text). */
@@ -1728,15 +1735,11 @@ function parseInlineHtml(s, i) {
   if (s.startsWith('<!--', i)) {
     if (s.startsWith('<!-->', i)) return i + 5;
     if (s.startsWith('<!--->', i)) return i + 6;
-    let j = i + 4;
-    while (j < n) {
-      if (s[j] === '-' && s[j + 1] === '-') {
-        if (s[j + 2] === '>') return j + 3;
-        return -1;
-      }
-      j++;
-    }
-    return -1;
+    // a comment ends at the first ` -->`; a `--` in the middle (even
+    // followed by a newline, cm-625, or by other text) does not end
+    // or invalidate it — marked accepts `<!-- a -- b -->` as a comment
+    const end = s.indexOf('-->', i + 4);
+    return end < 0 ? -1 : end + 3;
   }
   if (s.startsWith('<?', i)) {
     const end = s.indexOf('?>', i + 2);
@@ -1876,7 +1879,12 @@ function parseInline(text, refDefs) {
         continue;
       }
       if (i + 1 < n && isAsciiPunct(text[i + 1])) {
-        addTextTo(out, text[i + 1]);
+        // a backslash-escaped punct is its own text node (marked .esc):
+        // it is literal text, and it must not merge with the neighbours
+        // into a word the autolink pass would read as an email
+        const nd = textNode(text[i + 1]);
+        nd.esc = true;
+        out.push(nd);
         i += 2;
         continue;
       }
@@ -2227,8 +2235,10 @@ function backpedal(cand) {
   }
 }
 /* Try to match one extended autolink starting at s[i].  Returns
-   {href, text, end} or null. */
-function matchExtAutolink(s, i) {
+   {href, text, end} or null.  `nextChar` is the first character of the
+   following inline node (when the candidate ends at the end of `s`),
+   used for the trailing - _ + kill rule. */
+function matchExtAutolink(s, i, nextChar) {
   const n = s.length;
   // www. (case-insensitive)
   if (i + 4 <= n && s.slice(i, i + 4).toLowerCase() === 'www.') {
@@ -2254,8 +2264,11 @@ function matchExtAutolink(s, i) {
       const emStart = i + schemeLen;
       const emEnd = matchEmail(s, emStart);
       if (emEnd > emStart) {
-        // trailing - _ + kills the link entirely
-        if (emEnd < n && (s[emEnd] === '-' || s[emEnd] === '_' || s[emEnd] === '+')) return null;
+        // trailing - _ + kills the link entirely (also when the killer
+        // is the first char of the next inline node, e.g. a `_`
+        // delimiter node after the email)
+        const after = emEnd < n ? s[emEnd] : nextChar;
+        if (after === '-' || after === '_' || after === '+') return null;
         let end = emEnd;
         if (end < n && s[end] === '/') {
           let m = end + 1;
@@ -2306,16 +2319,19 @@ function matchExtAutolink(s, i) {
     const emEnd = matchEmail(s, i);
     if (emEnd > i) {
       // trailing - _ + kills the link entirely (gfm-631: the `+` after
-      // `hello@mail` means the address is cut off, so no link forms)
-      if (emEnd < n && (s[emEnd] === '-' || s[emEnd] === '_' || s[emEnd] === '+')) return null;
+      // `hello@mail` means the address is cut off, so no link forms);
+      // the killer may be the first char of the next inline node
+      const after = emEnd < n ? s[emEnd] : nextChar;
+      if (after === '-' || after === '_' || after === '+') return null;
       const email = s.slice(i, emEnd);
       return { href: 'mailto:' + email, text: email, end: emEnd };
     }
   }
   return null;
 }
-/* Split a plain text string into text/link nodes at extended autolinks. */
-function autolinkSplit(s) {
+/* Split a plain text string into text/link nodes at extended autolinks.
+   `nextChar` is the first character of the following inline node. */
+function autolinkSplit(s, nextChar) {
   const parts = [];
   let i = 0;   // start of pending (not yet emitted) text
   let pos = 0; // search position for the next candidate
@@ -2341,7 +2357,7 @@ function autolinkSplit(s) {
       if (next < 0 || st < next) next = st;
     }
     if (next < 0) break;
-    const m = matchExtAutolink(s, next);
+    const m = matchExtAutolink(s, next, nextChar);
     if (!m) { pos = next + 1; continue; }
     if (next > i) parts.push(textNode(s.slice(i, next)));
     parts.push({ t: 'link', href: m.href, title: '', children: [textNode(m.text)] });
@@ -2372,7 +2388,11 @@ function extAutolinkPass(nodes, state) {
     }
     if (nd.t !== 'text' || nd.delim) continue;
     if (state.inLink) continue;
-    const parts = autolinkSplit(nd.s);
+    // the first character of the following node (e.g. a `_` delimiter
+    // node right after an email) counts for the trailing - _ + kill
+    const nxt = nodes[idx + 1];
+    const nextChar = (nxt && nxt.t === 'text' && nxt.s) ? nxt.s[0] : null;
+    const parts = autolinkSplit(nd.s, nextChar);
     if (parts.length > 1 || (parts.length === 1 && parts[0].t === 'link')) {
       nodes.splice(idx, 1, ...parts);
       idx += parts.length - 1;
@@ -2418,13 +2438,18 @@ function renderInlineNodes(nodes) {
 function coalesceText(nodes) {
   const out = [];
   for (const nd of nodes) {
+    if (nd.t === 'text' && nd.esc) {
+      // an escape-resolved char stays its own node (see addTextTo)
+      out.push(nd);
+      continue;
+    }
     if (nd.t === 'text' && nd.delim && !nd.delim.canOpen && !nd.delim.canClose) {
       const last = out[out.length - 1];
-      if (last && last.t === 'text' && !last.delim) last.s += nd.s;
+      if (last && last.t === 'text' && !last.delim && !last.esc) last.s += nd.s;
       else out.push(textNode(nd.s));
     } else if (nd.t === 'text' && !nd.delim) {
       const last = out[out.length - 1];
-      if (last && last.t === 'text' && !last.delim) last.s += nd.s;
+      if (last && last.t === 'text' && !last.delim && !last.esc) last.s += nd.s;
       else out.push(nd);
     } else {
       out.push(nd);
