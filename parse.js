@@ -134,12 +134,14 @@ function escCode(s) {
 // it begins an entity-like &word; which is kept verbatim).
 function encodeHref(url) {
   // encodeURI would turn %20 into %2520; keep valid %XX sequences
-  // intact (cm-503) and encode the rest
+  // intact (cm-503) and encode the rest.  A bare `%` (not part of a
+  // %XX sequence) is left as-is, not turned into %25 (doc-01: the
+  // badge URL `.../npm-98%-blue.svg` keeps its `%`)
   const parts = url.split(/(%[0-9A-Fa-f]{2})/g);
   let enc = '';
   for (const p of parts) {
     if (/^%[0-9A-Fa-f]{2}$/.test(p)) enc += p;
-    else { try { enc += encodeURI(p); } catch (e) { enc += p; } }
+    else { try { enc += encodeURI(p).replace(/%25/g, '%'); } catch (e) { enc += p; } }
   }
   return escText(enc);
 }
@@ -227,6 +229,27 @@ function curIndent(cur) {
 function curRest(cur) {
   if (cur.tab > 0) return ' '.repeat(cur.tab) + cur.s.slice(cur.pos + 1);
   return cur.s.slice(cur.pos);
+}
+
+// Expand every tab in `s` to spaces (tab stops every 4 columns),
+// where the first character sits at column `startCol`.  Code blocks
+// keep their tabs expanded (doc-01: a tab in fenced code becomes
+// spaces, not a literal tab).
+function expandTabs(s, startCol) {
+  if (s.indexOf('\t') < 0) return s;
+  let out = '', col = startCol;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    if (c === 9) {
+      const w = 4 - (col % 4);
+      out += ' '.repeat(w);
+      col += w;
+    } else {
+      out += s[i];
+      col++;
+    }
+  }
+  return out;
 }
 
 // Is the rest of the line blank (only spaces/tabs)?
@@ -1452,7 +1475,8 @@ function parseBlocks(src) {
 
     // ---- Phase 3: add the line to the tip leaf
     if (tip.t === B_CODE) {
-      // indented code: strip up to 4 columns
+      // indented code: strip up to 4 columns (tabs in the content
+      // itself are kept literally, cm-001/002/003)
       curAdvance(cur, Math.min(4, curIndent(cur)));
       tip.lines.push(curRest(cur));
       return null;
@@ -2334,8 +2358,8 @@ function backpedal(cand) {
    used for the trailing - _ + kill rule. */
 function matchExtAutolink(s, i, nextChar) {
   const n = s.length;
-  // www. (case-insensitive)
-  if (i + 4 <= n && s.slice(i, i + 4).toLowerCase() === 'www.') {
+  // www. — lowercase only (doc-09: `Www.` and `WWW.` do not link)
+  if (i + 4 <= n && s.slice(i, i + 4) === 'www.') {
     const end = urlRunEnd(s, i);
     let cand = s.slice(i, end);
     cand = backpedal(cand);
@@ -2433,7 +2457,8 @@ function autolinkSplit(s, nextChar) {
   while (pos < n) {
     // find the next plausible candidate start at or after pos
     let next = -1;
-    const w = s.toLowerCase().indexOf('www.', pos);
+    // www. is lowercase-only (doc-09)
+    const w = s.indexOf('www.', pos);
     if (w >= 0) next = w;
     const sch = s.slice(pos).search(/[A-Za-z][A-Za-z0-9+.-]{1,31}:\/\//);
     if (sch >= 0 && (next < 0 || pos + sch < next)) next = pos + sch;
