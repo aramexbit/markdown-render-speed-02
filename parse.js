@@ -1536,10 +1536,16 @@ function parseBlocks(src) {
       // stop when the cursor has advanced past the line start
       // (doc-01: tab at col 13 -> 3 spaces; doc-06 js: col 7 -> 1;
       // doc-06 json: col 8 -> 4); a tab at the very start of the
-      // line (col 0) stays literal (top-level fence)
+      // line (col 0) stays literal (top-level fence).  Inside a
+      // blockquote the tab always becomes 2 spaces (the `> ` prefix
+      // width), whatever the nesting depth (doc-05 `> > ~~~py`).
       let rest = curRest(cur);
       if (cur.tab === 0 && rest.charCodeAt(0) === 9 && cur.col > 0) {
-        rest = ' '.repeat(4 - (cur.col % 4)) + rest.slice(1);
+        let inBq = false;
+        for (let p = tip.parent; p; p = p.parent) {
+          if (p.t === B_BQ) { inBq = true; break; }
+        }
+        rest = (inBq ? '  ' : ' '.repeat(4 - (cur.col % 4))) + rest.slice(1);
       }
       tip.lines.push(rest);
       return null;
