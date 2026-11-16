@@ -49,6 +49,12 @@ function tryEntity(s, i) {
       else break;
     }
     if (j === ds || j >= n || s.charCodeAt(j) !== 59) return null;
+    // digit-count limit (CommonMark): a decimal reference has at most
+    // 7 digits, a hex one at most 6.  More digits means it is not a
+    // character reference at all (cm-028: `&#87654321;` stays literal),
+    // while a value just over the range with a legal digit count
+    // decodes to U+FFFD (`&#x110000;`)
+    if (hex ? (j - ds) > 6 : (j - ds) > 7) return null;
     let cp = 0;
     for (let k = ds; k < j; k++) {
       const c = s.charCodeAt(k);
@@ -164,9 +170,11 @@ function unescapeStr(s) {
 // collapse whitespace, trim, fold case.
 // Full case folding maps ß and ẞ to "ss" (plain toLowerCase does not).
 function normalizeLabel(s) {
-  // backslash escapes resolve first: `ref\[` matches `ref[`, `bar\\`
-  // matches `bar\` (cm-549, cm-550)
-  s = s.replace(/\\([\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E])/g, '$1');
+  // only backslash escapes of label-structural characters resolve:
+  // `ref\[` matches `ref[`, `bar\\` matches `bar\` (cm-549, cm-550).
+  // An escape of any other punctuation does NOT resolve, so `foo\!`
+  // does not match a `[foo!]` definition (cm-545)
+  s = s.replace(/\\([\[\]\\])/g, '$1');
   return s.replace(/[\s]+/g, ' ').trim()
     .replace(/\u00DF/g, 'ss').replace(/\u1E9E/g, 'ss').toLowerCase();
 }
@@ -442,7 +450,10 @@ function atxHeading(cur) {
   while (end > j && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end--;
   let k = end;
   while (k > j && s.charCodeAt(k - 1) === 35) k--;
-  if (k < end && k > j && (s.charCodeAt(k - 1) === 32 || s.charCodeAt(k - 1) === 9)) end = k - 1;
+  // the closing run may be the entire content (cm-079: `### ###` is an
+  // empty h3), so the run may start exactly at `j` — the char before
+  // it is then the space after the opening hashes
+  if (k < end && k >= j && (s.charCodeAt(k - 1) === 32 || s.charCodeAt(k - 1) === 9)) end = k - 1;
   while (end > j && (s.charCodeAt(end - 1) === 32 || s.charCodeAt(end - 1) === 9)) end--;
   return [lvl, j, end];
 }
@@ -509,10 +520,13 @@ function listMarker(cur) {
   let i = cur.pos;
   const c = s.charCodeAt(i);
   if (c === 42 || c === 43 || c === 45) {
+    // the bullet char is the list's delimiter: a different bullet
+    // starts a new list (cm-301: `-` then `+` are two lists)
+    const bullet = String.fromCharCode(c);
     i++;
     // content must follow after 1+ spaces, or the marker is empty
     if (i >= s.length) {
-      return { ordered: false, delim: null, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: true, after: i };
+      return { ordered: false, delim: bullet, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: true, after: i };
     }
     const nc = s.charCodeAt(i);
     if (nc === 32 || nc === 9) {
@@ -526,12 +540,12 @@ function listMarker(cur) {
       if (sp === 0) return null;
       if (j >= s.length) {
         // marker + only spaces: empty item; content indent is marker+1
-        return { ordered: false, delim: null, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: true, after: i };
+        return { ordered: false, delim: bullet, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: true, after: i };
       }
       if (sp >= 5) {
-        return { ordered: false, delim: null, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: false, after: i };
+        return { ordered: false, delim: bullet, start: 0, markerLen: 1, contentIndent: startCol + 2, empty: false, after: i };
       }
-      return { ordered: false, delim: null, start: 0, markerLen: 1, contentIndent: col, empty: false, after: j };
+      return { ordered: false, delim: bullet, start: 0, markerLen: 1, contentIndent: col, empty: false, after: j };
     }
     return null;
   }
@@ -575,7 +589,8 @@ function listMarker(cur) {
 // Does list A match list B (same type/delimiter, and ordered start rule)?
 function sameList(a, b) {
   if (a.ordered !== b.ordered) return false;
-  if (!a.ordered) return true;
+  // same delimiter: `-` vs `+`/`*` (unordered) and `.` vs `)` (ordered)
+  // are different lists (cm-301, cm-302)
   return a.delim === b.delim;
 }
 
@@ -947,7 +962,12 @@ function parseBlocks(src) {
       const plines = r.rest.split('\n');
       if (plines.length >= 2) {
         const aligns = tableDelimiter(plines[1]);
-        if (aligns && (plines[1].indexOf('|') >= 0 || plines[0].indexOf('|') >= 0)) {
+        // the delimiter row must have the same number of columns as
+        // the header, or it is not a table at all (gfm-203: a 1-column
+        // delimiter under a 2-column header is a plain paragraph)
+        const head0 = splitTableRow(plines[0]);
+        if (aligns && aligns.length === head0.length &&
+            (plines[1].indexOf('|') >= 0 || plines[0].indexOf('|') >= 0)) {
           // convert to a table
           const tbl = newBlock(B_TABLE, b.parent);
           tbl.align = aligns;
@@ -1119,6 +1139,16 @@ function parseBlocks(src) {
 
     // ---- blank line
     if (blank) {
+      // a blank line inside a fenced code block is content, not a
+      // terminator: the fence ends only at its closing fence (cm-127,
+      // cm-129).  Strip up to the fence indent from the (whitespace)
+      // line first.
+      if (tip.t === B_FENCE) {
+        const strip = Math.min(tip.fenceIndent || 0, curIndent(cur));
+        if (strip > 0) curAdvance(cur, strip);
+        tip.lines.push(curRest(cur));
+        return null;
+      }
       // html blocks of types 1-5 continue across blank lines (they end
       // only at their closing sequence); the blank line joins the block
       if (tip.t === B_HTML && tip.hType >= 1 && tip.hType <= 5) {
@@ -1149,8 +1179,9 @@ function parseBlocks(src) {
       }
       if (rawBlank) { blankPending = true; blankScope = null; }
       else if (lastConsumed) { blankPending = true; blankScope = lastConsumed; }
-      // a blank line closes a paragraph / code / html / fence tip
-      if (tip.t === B_PARA || tip.t === B_CODE || tip.t === B_HTML || tip.t === B_FENCE) {
+      // a blank line closes a paragraph / code / html tip (a fence is
+      // handled above — blank lines are its content, not a terminator)
+      if (tip.t === B_PARA || tip.t === B_CODE || tip.t === B_HTML) {
         if (tip.t === B_PARA && tip.c === undefined) { /* para */ }
         const parent = tip.parent;
         // remember whether the html block is followed by a blank line
@@ -1280,6 +1311,9 @@ function parseBlocks(src) {
         }
         const f = addChild(container, newBlock(B_FENCE, container));
         f.fenceChar = fs[0]; f.fenceLen = fs[1]; f.info = fs[2]; f.lines = [];
+        // the fence's indent (0-3): content lines have up to this many
+        // leading spaces stripped (cm-131/132/133)
+        f.fenceIndent = ind;
         tip = f;
         return null;
       }
@@ -1387,6 +1421,10 @@ function parseBlocks(src) {
         }
       }
       cur.pos = save.pos; cur.col = save.col; cur.tab = save.tab;
+      // not a closing fence: strip up to the fence indent from the
+      // content line (cm-131/132/133)
+      const strip = Math.min(tip.fenceIndent || 0, curIndent(cur));
+      if (strip > 0) curAdvance(cur, strip);
       tip.lines.push(curRest(cur));
       return null;
     }
@@ -2475,7 +2513,10 @@ function renderTable(tbl, refDefs, state) {
     out += '<th' + (a ? ' align="' + a + '"' : '') + '>' +
       renderInline(tbl.head[ci], refDefs, state) + '</th>\n';
   }
-  out += '</tr>\n</thead>\n<tbody>';
+  out += '</tr>\n</thead>\n';
+  // a table with no body rows has no <tbody> at all (gfm-205)
+  if (tbl.body.length === 0) return out + '</table>\n';
+  out += '<tbody>';
   for (const row of tbl.body) {
     out += '<tr>\n';
     for (let ci = 0; ci < row.length; ci++) {
