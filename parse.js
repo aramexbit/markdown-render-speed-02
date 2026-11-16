@@ -852,6 +852,17 @@ function parseBlocks(src) {
     return b.c.length ? b.c[b.c.length - 1] : null;
   }
 
+  // The open child of a container: the child on the path from it down
+  // to `tip` (the deepest open block).  Unlike lastChildOf, this never
+  // returns a block that has already been closed — a closed blockquote
+  // must not be re-matched by a later `>` line (cm-242, cm-252).
+  function openChildOf(n) {
+    if (tip === n) return null;
+    let c = tip;
+    while (c && c.parent !== n) c = c.parent;
+    return c || null;
+  }
+
   // deepest open container (doc/bq/list/item) starting from the tip
   function deepestContainer() {
     let n = tip;
@@ -1005,7 +1016,7 @@ function parseBlocks(src) {
     if (!item.pre) {
       let n = doc;
       for (;;) {
-        const child = lastChildOf(n);
+        const child = openChildOf(n);
         if (!child) break;
         if (child.t === B_BQ) {
           const ind = curIndent(cur);
@@ -1062,7 +1073,8 @@ function parseBlocks(src) {
           lastConsumed && lastConsumed.t === B_BQ) {
         const nextLine = qi + 1 < queue.length ? queue[qi + 1].s : null;
         if (!nextContinuesBq(nextLine, lastConsumed)) {
-          tip.lines.push(curRest(cur));
+          const rest = curRest(cur);
+          if (rest.length > 0) tip.lines.push(rest);
           const l = closeTo(tip.parent);
           if (l) return { leftovers: l, retry: true };
           tip = tip.parent;
@@ -1083,6 +1095,19 @@ function parseBlocks(src) {
       } else if (tip.t === B_ITEM && tip.c.length === 0) {
         tip.closedByBlank = true;
       }
+      // a truly blank line ends a blockquote: the next `>` starts a
+      // new one (cm-242, cm-252).  Lists are not closed by blank lines.
+      if (rawBlank) {
+        let bq = null;
+        for (let n = tip; n && n.t !== B_DOC; n = n.parent) {
+          if (n.t === B_BQ) { bq = n; break; }
+        }
+        if (bq) {
+          const l = closeTo(bq.parent);
+          if (l) return { leftovers: l, retry: true };
+          tip = bq.parent;
+        }
+      }
       return null;
     }
 
@@ -1100,6 +1125,11 @@ function parseBlocks(src) {
         if (l) return { leftovers: l, retry: true };
       } else skipPhase2 = true;
     }
+    // lastIndentSave: the indentSave of the last Phase 2 iteration —
+    // the cursor after every container prefix is stripped but before
+    // the line's own leading spaces.  A new paragraph restores it so
+    // it keeps its leading spaces (up to 3, cm-275).
+    let lastIndentSave = null;
     for (; !skipPhase2;) {
       const ind = curIndent(cur);
       if (ind >= 4 && tip.t !== B_PARA) {
@@ -1114,6 +1144,7 @@ function parseBlocks(src) {
       // save the cursor before stripping the block indent: an HTML block
       // keeps its leading spaces, so its branch restores this position
       const indentSave = { pos: cur.pos, col: cur.col, tab: cur.tab };
+      lastIndentSave = indentSave;
       if (ind < 4) curAdvance(cur, ind);
       // setext underline when the tip is a paragraph
       if (tip.t === B_PARA) {
@@ -1302,7 +1333,11 @@ function parseBlocks(src) {
       return null;
     }
     // tip is a container: start a new paragraph (unless the line is
-    // empty after the container prefixes were stripped)
+    // empty after the container prefixes were stripped).  Restore the
+    // last Phase 2 indentSave so the paragraph keeps its leading spaces.
+    if (lastIndentSave) {
+      cur.pos = lastIndentSave.pos; cur.col = lastIndentSave.col; cur.tab = lastIndentSave.tab;
+    }
     if (curIsBlank(cur)) return null;
     const p = addChild(container, newBlock(B_PARA, container));
     p.lines = [curRest(cur)];
@@ -1778,7 +1813,10 @@ function parseInline(text, refDefs) {
       } else {
         out.push({ t: 'softbreak' });
       }
-      i = k;
+      // skip the spaces after the newline only when real content
+      // follows on that line; a line that is only spaces is content
+      // (cm-241: the trailing space of `> foo` / `>  ` is kept)
+      i = (k < n && text[k] !== '\n') ? k : i + 1;
       continue;
     }
 
