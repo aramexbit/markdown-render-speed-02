@@ -127,8 +127,14 @@ function escCode(s) {
 // then HTML-escape the result (' becomes &#39;, & becomes &amp; unless
 // it begins an entity-like &word; which is kept verbatim).
 function encodeHref(url) {
-  let enc;
-  try { enc = encodeURI(url); } catch (e) { enc = url; }
+  // encodeURI would turn %20 into %2520; keep valid %XX sequences
+  // intact (cm-503) and encode the rest
+  const parts = url.split(/(%[0-9A-Fa-f]{2})/g);
+  let enc = '';
+  for (const p of parts) {
+    if (/^%[0-9A-Fa-f]{2}$/.test(p)) enc += p;
+    else { try { enc += encodeURI(p); } catch (e) { enc += p; } }
+  }
   return escText(enc);
 }
 
@@ -1584,15 +1590,20 @@ function isValidLabel(label) {
     if (c === '\\' && j + 1 < n) { j += 2; continue; }
     if (c === '\\') { j++; continue; }
     if (c === '[') {
-      let k = j + 1, ok = false;
+      // nested bracket: find its matching ']' tracking nesting depth
+      // (labels may nest arbitrarily: `[link [foo [bar]]]`, cm-512)
+      let depth = 1, k = j + 1;
       while (k < n) {
         const d = label[k];
         if (d === '\\' && k + 1 < n) { k += 2; continue; }
-        if (d === ']') { ok = true; break; }
-        if (d === '[') break;
+        if (d === '[') depth++;
+        else if (d === ']') {
+          depth--;
+          if (depth === 0) break;
+        }
         k++;
       }
-      if (!ok) return false;
+      if (depth !== 0) return false;
       j = k + 1; continue;
     }
     if (c === '`') {
@@ -1969,9 +1980,12 @@ function parseInline(text, refDefs) {
         i++;
         continue;
       }
-      // try to form a link/image
+      // try to form a link/image.  The `(` or `[` must IMMEDIATELY
+      // follow the `]` — no space or newline between them (cm-511:
+      // `[link] (/uri)` is literal; cm-542: `[foo] [bar]` is two
+      // shortcuts, not a full reference).
       let link = null;
-      const j = skipInlineSpace(text, i + 1);
+      const j = i + 1;
       if (j < n && text[j] === '(') {
         link = parseInlineLink(text, j);
         if (!link) {
@@ -2006,6 +2020,10 @@ function parseInline(text, refDefs) {
       const labelNodes = out.slice(opener.nodeIdx);
       out.length = opener.nodeIdx;
       if (opener.isImage) {
+        // resolve emphasis inside the label before taking plain text
+        // for the alt attribute (cm-573: `![foo *bar*]` has alt
+        // `foo bar`, not `foo *bar*`)
+        processEmphasisList(labelNodes);
         out[opener.nodeIdx - 1] = { t: 'image', src: link.href, alt: plainText(labelNodes), title: link.title };
       } else {
         out[opener.nodeIdx - 1] = { t: 'link', href: link.href, title: link.title, children: labelNodes };
