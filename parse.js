@@ -1537,9 +1537,22 @@ function parseBlocks(src) {
         if (curIndent(cur) >= 4 && lastConsumed && lastConsumed.t === B_ITEM) {
           curAdvance(cur, 4);
         }
+        tip.lastLazy = false;
       } else {
         // lazy continuation: strip 4 if indent >= 4
         if (curIndent(cur) >= 4) curAdvance(cur, 4);
+        // a lazy setext `=` underline whose previous line was also lazy
+        // becomes paragraph text with exactly 4 spaces prepended
+        // (cm-093); a lazy `===` after a properly-prefixed line gets none
+        if (tip.lastLazy) {
+          const rest0 = curRest(cur);
+          if (/^ *[=]+ *$/.test(rest0)) {
+            tip.lines.push('    ' + rest0.replace(/^ +/, ''));
+            tip.lastLazy = true;
+            return null;
+          }
+        }
+        tip.lastLazy = true;
       }
       tip.lines.push(curRest(cur));
       return null;
