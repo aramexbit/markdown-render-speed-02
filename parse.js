@@ -160,9 +160,13 @@ function unescapeStr(s) {
   return out + s.slice(start);
 }
 
-// Normalise a link reference label: collapse whitespace, trim, fold case.
+// Normalise a link reference label: resolve backslash escapes,
+// collapse whitespace, trim, fold case.
 // Full case folding maps ß and ẞ to "ss" (plain toLowerCase does not).
 function normalizeLabel(s) {
+  // backslash escapes resolve first: `ref\[` matches `ref[`, `bar\\`
+  // matches `bar\` (cm-549, cm-550)
+  s = s.replace(/\\([\x21-\x2F\x3A-\x40\x5B-\x60\x7B-\x7E])/g, '$1');
   return s.replace(/[\s]+/g, ' ').trim()
     .replace(/\u00DF/g, 'ss').replace(/\u1E9E/g, 'ss').toLowerCase();
 }
@@ -284,7 +288,7 @@ function parseHtmlTag(s, i) {
     else break;
   }
   if (closing) {
-    while (j < n && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9)) j++;
+    while (j < n && (s.charCodeAt(j) === 32 || s.charCodeAt(j) === 9 || s.charCodeAt(j) === 10 || s.charCodeAt(j) === 13 || s.charCodeAt(j) === 12)) j++;
     if (j < n && s.charCodeAt(j) === 62) return j + 1;
     if (j >= n) return -2;
     return -1;
@@ -292,7 +296,7 @@ function parseHtmlTag(s, i) {
   // open tag: attributes then optional '/'
   for (;;) {
     let k = j;
-    while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9)) k++;
+    while (k < n && (s.charCodeAt(k) === 32 || s.charCodeAt(k) === 9 || s.charCodeAt(k) === 10 || s.charCodeAt(k) === 13 || s.charCodeAt(k) === 12)) k++;
     if (k >= n) return -2;
     const c = s.charCodeAt(k);
     if (c === 62) return k + 1;
@@ -312,10 +316,10 @@ function parseHtmlTag(s, i) {
     }
     // optional = value
     let m = j;
-    while (m < n && (s.charCodeAt(m) === 32 || s.charCodeAt(m) === 9)) m++;
+    while (m < n && (s.charCodeAt(m) === 32 || s.charCodeAt(m) === 9 || s.charCodeAt(m) === 10 || s.charCodeAt(m) === 13 || s.charCodeAt(m) === 12)) m++;
     if (m < n && s.charCodeAt(m) === 61) {
       m++;
-      while (m < n && (s.charCodeAt(m) === 32 || s.charCodeAt(m) === 9)) m++;
+      while (m < n && (s.charCodeAt(m) === 32 || s.charCodeAt(m) === 9 || s.charCodeAt(m) === 10 || s.charCodeAt(m) === 13 || s.charCodeAt(m) === 12)) m++;
       if (m >= n) return -2;
       const q = s.charCodeAt(m);
       if (q === 34 || q === 39) {
@@ -327,7 +331,7 @@ function parseHtmlTag(s, i) {
         let e = m;
         while (e < n) {
           const d = s.charCodeAt(e);
-          if (d === 32 || d === 9 || d === 34 || d === 39 || d === 61 || d === 60 || d === 62 || d === 96) break;
+          if (d === 32 || d === 9 || d === 10 || d === 13 || d === 12 || d === 34 || d === 39 || d === 61 || d === 60 || d === 62 || d === 96) break;
           e++;
         }
         if (e === m) return -1;
@@ -1391,7 +1395,13 @@ function parseBlocks(src) {
       return null;
     }
     if (tip.t === B_PARA) {
-      // paragraph continuation: lazy vs proper strip
+      // paragraph continuation: lazy vs proper strip.  Restore the
+      // last Phase 2 indentSave first so the line keeps its leading
+      // spaces (cm-049 keeps `    ***`, cm-552 keeps ` ]`); the strip
+      // rules below then remove only what they should.
+      if (lastIndentSave) {
+        cur.pos = lastIndentSave.pos; cur.col = lastIndentSave.col; cur.tab = lastIndentSave.tab;
+      }
       if (allMatched) {
         // proper continuation: the container matching already consumed the
         // item content indent; apply the extra-4 strip when the line's
