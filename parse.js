@@ -796,33 +796,49 @@ function parseRefDefs(text, refs) {
     let after = tj;
     while (after < lineEnd && (text.charCodeAt(after) === 32 || text.charCodeAt(after) === 9)) after++;
     let titleOk = false;
-    if (after < lineEnd) {
+    // a title on this line must be separated from the destination by
+    // at least one space/tab (cm-201: `[foo]: <bar>(baz)` is not a
+    // definition — the `(baz)` directly after `<bar>` is junk)
+    if (after < lineEnd && after > tj) {
       const q = text.charCodeAt(after);
       if (q === 34 || q === 39 || q === 40) {
         const close = q === 40 ? 41 : q;
+        // the title may span lines (cm-196: `'\\ntitle\\nline1\\nline2\\n'`):
+        // scan for the closing quote across newlines, stopping at a
+        // blank line
         let e = after + 1, closed = false;
-        while (e < lineEnd) {
+        while (e < n) {
           const c = text.charCodeAt(e);
-          if (c === 92 && e + 1 < lineEnd) { e += 2; continue; }
+          if (c === 92 && e + 1 < n) { e += 2; continue; }
           if (c === close) { closed = true; break; }
+          if (c === 10) {
+            let k = e + 1;
+            while (k < n && (text.charCodeAt(k) === 32 || text.charCodeAt(k) === 9)) k++;
+            if (k >= n || text.charCodeAt(k) === 10) break;
+          }
           e++;
         }
         if (closed) {
+          // rest of the closing-quote line must be only whitespace
+          let le = e;
+          while (le < n && text.charCodeAt(le) !== 10) le++;
           let rest = e + 1;
-          while (rest < lineEnd && (text.charCodeAt(rest) === 32 || text.charCodeAt(rest) === 9)) rest++;
-          if (rest === lineEnd) {
+          while (rest < le && (text.charCodeAt(rest) === 32 || text.charCodeAt(rest) === 9)) rest++;
+          if (rest === le) {
             title = unescapeStr(text.slice(after + 1, e));
             titleOk = true;
-            j = lineEnd;
+            j = le;
           }
         }
       }
     }
     if (!titleOk) {
-      // title on the next line?
+      // title on the next line?  The title line is a continuation line
+      // of the paragraph, so its leading whitespace is not limited to
+      // 3 spaces (cm-193: the title sits under 11 spaces)
       if (lineEnd < n) {
-        let nl = lineEnd + 1, sp2 = 0;
-        while (nl < n && text.charCodeAt(nl) === 32 && sp2 < 3) { sp2++; nl++; }
+        let nl = lineEnd + 1;
+        while (nl < n && (text.charCodeAt(nl) === 32 || text.charCodeAt(nl) === 9)) nl++;
         // next line must not be blank
         if (nl < n && text.charCodeAt(nl) !== 10) {
           let le2 = nl;
@@ -1126,6 +1142,10 @@ function parseBlocks(src) {
         } else {
           // a blank line after an html block removes its trailing newline
           if ((rawBlank || curIsBlank(cur)) && tip.t === B_HTML) tip.htmlAddNL = false;
+          // an html block cut off by a new block/item (containers no
+          // longer match) loses its trailing newline too (cm-175: a
+          // `<div>` in a list item, closed by the next item)
+          if (tip.t === B_HTML) tip.htmlAddNL = false;
           const l = closeTo(container);
           if (l) return { leftovers: l, retry: true };
         }
@@ -1159,7 +1179,10 @@ function parseBlocks(src) {
       // blank line is part of the code; trailing blanks are stripped
       // at finalize, cm-085)
       if (tip.t === B_CODE) {
-        tip.lines.push('');
+        // a whitespace-only line keeps the spaces beyond the 4-column
+        // code indent (cm-112: a 6-space line inside code is `  `)
+        curAdvance(cur, Math.min(4, curIndent(cur)));
+        tip.lines.push(curRest(cur));
         return null;
       }
       // cm-241: a container-blank line (blank after a marker, raw not blank)
@@ -1261,8 +1284,12 @@ function parseBlocks(src) {
             const p = tip.parent, idx = p.c.indexOf(tip);
             if (idx >= 0) p.c.splice(idx, 1);
             tip = p;
-            // the underline line is re-processed as a fresh line
-            return { leftovers: [{ s: line, term: item.term, pre: true }], retry: true };
+            // the underline line is NOT re-queued (that would process
+            // it twice: once as a leftover, once as the original line,
+            // and the second pass would make it a setext heading of
+            // itself, cm-216).  Instead break out of Phase 2 so Phase 3
+            // starts a fresh paragraph with this line.
+            break;
           }
           const h = newBlock(B_H, tip.parent);
           h.lvl = sl;
@@ -1296,6 +1323,12 @@ function parseBlocks(src) {
           const pl = closeTo(tip.parent);
           if (pl) return { leftovers: pl, retry: true };
         }
+        // a heading cannot live inside a list: close the list first
+        if (container.t === B_LIST) {
+          const pl = closeTo(container.parent);
+          if (pl) return { leftovers: pl, retry: true };
+          container = container.parent;
+        }
         const h = addChild(container, newBlock(B_H, container));
         h.lvl = atx[0];
         h.text = cur.s.slice(atx[1], atx[2]);
@@ -1308,6 +1341,12 @@ function parseBlocks(src) {
         if (tip.t === B_PARA || tip.t === B_CODE) {
           const pl = closeTo(tip.parent);
           if (pl) return { leftovers: pl, retry: true };
+        }
+        // a fenced code block cannot live inside a list either
+        if (container.t === B_LIST) {
+          const pl = closeTo(container.parent);
+          if (pl) return { leftovers: pl, retry: true };
+          container = container.parent;
         }
         const f = addChild(container, newBlock(B_FENCE, container));
         f.fenceChar = fs[0]; f.fenceLen = fs[1]; f.info = fs[2]; f.lines = [];
@@ -1323,6 +1362,13 @@ function parseBlocks(src) {
         if (tip.t === B_PARA || tip.t === B_CODE) {
           const pl = closeTo(tip.parent);
           if (pl) return { leftovers: pl, retry: true };
+        }
+        // an html block cannot live inside a list: close the list
+        // first so the block becomes a sibling (cm-308, cm-309)
+        if (container.t === B_LIST) {
+          const pl = closeTo(container.parent);
+          if (pl) return { leftovers: pl, retry: true };
+          container = container.parent;
         }
         const hb = addChild(container, newBlock(B_HTML, container));
         hb.hType = ht; hb.lines = []; hb.htmlAddNL = true;
@@ -1375,6 +1421,16 @@ function parseBlocks(src) {
             if (last && last.t === B_LIST && sameList(last, lm)) list = last;
           }
           if (!list) {
+            // a new list at the same level as an existing list is a
+            // sibling, not a child: close the old list first so the new
+            // one lands beside it (cm-301 `-` then `+`, cm-302 `.`
+            // then `)`); a sublist lives inside an item, where the
+            // container is the item, not the list
+            if (container.t === B_LIST) {
+              const pl = closeTo(container.parent);
+              if (pl) return { leftovers: pl, retry: true };
+              container = container.parent;
+            }
             list = addChild(container, newBlock(B_LIST, container));
             list.ordered = lm.ordered; list.delim = lm.delim; list.start = lm.start;
           }
