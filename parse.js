@@ -1333,6 +1333,14 @@ function parseBlocks(src) {
           const pl = closeTo(tip.parent);
           if (pl) return { leftovers: pl, retry: true };
         }
+        // a blockquote cannot live inside a list: close the list first
+        // (doc-03: a `>` line after an inner <ol> is a sibling of the
+        // list, inside the outer list item)
+        if (container.t === B_LIST) {
+          const pl = closeTo(container.parent);
+          if (pl) return { leftovers: pl, retry: true };
+          container = container.parent;
+        }
         const bq = addChild(container, newBlock(B_BQ, container));
         container = bq; tip = bq;
         curAdvance(cur, 1);
