@@ -1435,7 +1435,12 @@ function parseBlocks(src) {
       // list item
       const lm = listMarker(cur);
       if (lm) {
-        const canInterrupt = !tipIsPara || !allMatched || !lm.ordered || lm.start === 1;
+        // an ordered list may interrupt a paragraph only when it
+        // starts with 1 — unless it is a sublist inside the current
+        // list item (doc-04: `382900.` nested in a `-` item ends the
+        // item's paragraph and opens a nested <ol>)
+        const canInterrupt = !tipIsPara || !allMatched || !lm.ordered ||
+          lm.start === 1 || container.t === B_ITEM;
         const emptyItem = lm.empty;
         if (canInterrupt && !(tipIsPara && emptyItem)) {
           if (tip.t === B_PARA || tip.t === B_CODE) {
@@ -1513,7 +1518,16 @@ function parseBlocks(src) {
       // content line (cm-131/132/133)
       const strip = Math.min(tip.fenceIndent || 0, curIndent(cur));
       if (strip > 0) curAdvance(cur, strip);
-      tip.lines.push(curRest(cur));
+      // a leading tab in fenced-code content expands to the next tab
+      // stop when the cursor has advanced past the line start
+      // (doc-01: tab at col 13 -> 3 spaces; doc-06 js: col 7 -> 1;
+      // doc-06 json: col 8 -> 4); a tab at the very start of the
+      // line (col 0) stays literal (top-level fence)
+      let rest = curRest(cur);
+      if (cur.tab === 0 && rest.charCodeAt(0) === 9 && cur.col > 0) {
+        rest = ' '.repeat(4 - (cur.col % 4)) + rest.slice(1);
+      }
+      tip.lines.push(rest);
       return null;
     }
     if (tip.t === B_HTML) {
