@@ -1120,6 +1120,7 @@ function parseBlocks(src) {
 
     // ---- Phase 1: match open containers
     let container = doc, allMatched = true, lastConsumed = null, lazy = false;
+    let failChild = null;
     if (!item.pre) {
       let n = doc;
       for (;;) {
@@ -1127,16 +1128,16 @@ function parseBlocks(src) {
         if (!child) break;
         if (child.t === B_BQ) {
           const ind = curIndent(cur);
-          if (ind > 3) { allMatched = false; break; }
+          if (ind > 3) { allMatched = false; failChild = child; break; }
           const save = { pos: cur.pos, col: cur.col, tab: cur.tab };
           curAdvance(cur, ind);
-          if (curPeek(cur) !== 62) { cur.pos = save.pos; cur.col = save.col; cur.tab = save.tab; allMatched = false; break; }
+          if (curPeek(cur) !== 62) { cur.pos = save.pos; cur.col = save.col; cur.tab = save.tab; allMatched = false; failChild = child; break; }
           curAdvance(cur, 1);
           if (curPeek(cur) === 32) curAdvance(cur, 1);
           lastConsumed = child;
           container = child; n = child;
         } else if (child.t === B_ITEM) {
-          if (child.closedByBlank) { allMatched = false; break; }
+          if (child.closedByBlank) { allMatched = false; failChild = child; break; }
           const ind = curIndent(cur);
           if (curIsBlank(cur)) {
             // blank lines match items without consuming
@@ -1148,7 +1149,7 @@ function parseBlocks(src) {
             curAdvance(cur, child.cIndent - cur.col);
             lastConsumed = child;
             container = child; n = child;
-          } else { allMatched = false; break; }
+          } else { allMatched = false; failChild = child; break; }
         } else if (child.t === B_LIST) {
           container = child; n = child;
         } else {
@@ -1162,6 +1163,19 @@ function parseBlocks(src) {
       if (!allMatched) {
         if (tip.t === B_PARA && !curIsBlank(cur) && !lineStartsBlockAt(cur)) {
           lazy = true;
+        } else if (tip.t === B_FENCE) {
+          // fenced-code content ignores a LIST ITEM's indent: a content
+          // line that does not reach the enclosing item's content
+          // indent (e.g. `fn main()` at col 0 inside a fence in a
+          // list item, doc-05) is still fence content.  But a
+          // BLOCKQUOTE prefix is mandatory: a line without `>` closes
+          // the blockquote and the fence inside it (cm-128, cm-237).
+          // Phase 3 (which Phase 2 skips for fences) decides whether
+          // the line closes the fence or joins its content.
+          if (failChild && failChild.t === B_BQ) {
+            const l = closeTo(container);
+            if (l) return { leftovers: l, retry: true };
+          }
         } else {
           // a blank line after an html block removes its trailing newline
           if ((rawBlank || curIsBlank(cur)) && tip.t === B_HTML) tip.htmlAddNL = false;
