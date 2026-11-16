@@ -859,6 +859,23 @@ function parseBlocks(src) {
     return n || doc;
   }
 
+  // does the line at the cursor start a block that would interrupt a
+  // paragraph (used to decide lazy continuation: a block start is never
+  // a lazy line)?  Pure readers: none of the matchers moves the cursor.
+  // HTML type 7 does not interrupt a paragraph, so it is not a block
+  // start here; a list marker always interrupts when a container has
+  // already failed to match (canInterrupt is true then).
+  function lineStartsBlockAt(cur) {
+    if (curPeek(cur) === 62) return true;
+    if (atxHeading(cur)) return true;
+    if (fenceStart(cur)) return true;
+    const ht = htmlBlockType(cur);
+    if (ht && ht !== 7) return true;
+    if (thematicBreak(cur)) return true;
+    if (listMarker(cur)) return true;
+    return false;
+  }
+
   // Finalize a block when it is closed. Returns leftover lines (table) or null.
   function finalize(b) {
     if (b.t === B_PARA) {
@@ -984,7 +1001,7 @@ function parseBlocks(src) {
     const rawBlank = rawIsBlank(line);
 
     // ---- Phase 1: match open containers
-    let container = doc, allMatched = true, lastConsumed = null;
+    let container = doc, allMatched = true, lastConsumed = null, lazy = false;
     if (!item.pre) {
       let n = doc;
       for (;;) {
@@ -1017,10 +1034,17 @@ function parseBlocks(src) {
           break;
         }
       }
-      // close unmatched containers
+      // close unmatched containers — unless this is a lazy continuation
+      // of a paragraph (a non-blank, non-block-start line that does not
+      // match a container still joins the paragraph; the containers
+      // stay open)
       if (!allMatched) {
-        const l = closeTo(container);
-        if (l) return { leftovers: l, retry: true };
+        if (tip.t === B_PARA && !curIsBlank(cur) && !lineStartsBlockAt(cur)) {
+          lazy = true;
+        } else {
+          const l = closeTo(container);
+          if (l) return { leftovers: l, retry: true };
+        }
       }
     } else {
       container = deepestContainer();
@@ -1065,9 +1089,11 @@ function parseBlocks(src) {
     // ---- Phase 2: try to start new blocks at `container`
     // Fenced code and HTML blocks take the line directly (Phase 3).
     // An indented code block continues only while the indent is >= 4.
+    // A lazy continuation line never starts a block.
     const tipIsPara = tip.t === B_PARA;
     let skipPhase2 = false;
-    if (tip.t === B_FENCE || tip.t === B_HTML) skipPhase2 = true;
+    if (lazy) skipPhase2 = true;
+    else if (tip.t === B_FENCE || tip.t === B_HTML) skipPhase2 = true;
     else if (tip.t === B_CODE) {
       if (curIndent(cur) < 4) {
         const l = closeTo(tip.parent);
@@ -1275,7 +1301,9 @@ function parseBlocks(src) {
       tip.lines.push(curRest(cur));
       return null;
     }
-    // tip is a container: start a new paragraph
+    // tip is a container: start a new paragraph (unless the line is
+    // empty after the container prefixes were stripped)
+    if (curIsBlank(cur)) return null;
     const p = addChild(container, newBlock(B_PARA, container));
     p.lines = [curRest(cur)];
     tip = p;
