@@ -892,16 +892,27 @@ function parseBlocks(src) {
   // a lazy line)?  Pure readers: none of the matchers moves the cursor.
   // HTML type 7 does not interrupt a paragraph, so it is not a block
   // start here; a list marker always interrupts when a container has
-  // already failed to match (canInterrupt is true then).
+  // already failed to match (canInterrupt is true then).  Leading
+  // spaces (up to 3) are skipped first: an indented marker (` - bar`,
+  // cm-294/295) is still a block start.  Indent >= 4 is not a block
+  // start here (indented code cannot interrupt a paragraph).
   function lineStartsBlockAt(cur) {
-    if (curPeek(cur) === 62) return true;
-    if (atxHeading(cur)) return true;
-    if (fenceStart(cur)) return true;
-    const ht = htmlBlockType(cur);
-    if (ht && ht !== 7) return true;
-    if (thematicBreak(cur)) return true;
-    if (listMarker(cur)) return true;
-    return false;
+    const save = { pos: cur.pos, col: cur.col, tab: cur.tab };
+    const ind = curIndent(cur);
+    if (ind >= 4) return false;
+    if (ind > 0) curAdvance(cur, ind);
+    let r = false;
+    if (curPeek(cur) === 62) r = true;
+    else if (atxHeading(cur)) r = true;
+    else if (fenceStart(cur)) r = true;
+    else {
+      const ht = htmlBlockType(cur);
+      if (ht && ht !== 7) r = true;
+      else if (thematicBreak(cur)) r = true;
+      else if (listMarker(cur)) r = true;
+    }
+    cur.pos = save.pos; cur.col = save.col; cur.tab = save.tab;
+    return r;
   }
 
   // Finalize a block when it is closed. Returns leftover lines (table) or null.
@@ -1012,8 +1023,8 @@ function parseBlocks(src) {
         if (curPeek(cur) === 32) curAdvance(cur, 1);
       } else if (c.t === B_ITEM) {
         const ind = curIndent(cur);
-        if (ind < c.cIndent && !curIsBlank(cur)) return false;
-        if (ind >= c.cIndent) curAdvance(cur, c.cIndent);
+        if (cur.col + ind < c.cIndent && !curIsBlank(cur)) return false;
+        if (cur.col + ind >= c.cIndent) curAdvance(cur, c.cIndent - cur.col);
       } else if (c.t === B_LIST) {
         // lists consume nothing
       } else {
@@ -1053,8 +1064,11 @@ function parseBlocks(src) {
           if (curIsBlank(cur)) {
             // blank lines match items without consuming
             container = child; n = child;
-          } else if (ind >= child.cIndent) {
-            curAdvance(cur, child.cIndent);
+          } else if (cur.col + ind >= child.cIndent) {
+            // cIndent is an absolute column: advance the cursor to it
+            // (not by cIndent columns from here — that overshoots for
+            // nested items, cm-294)
+            curAdvance(cur, child.cIndent - cur.col);
             lastConsumed = child;
             container = child; n = child;
           } else { allMatched = false; break; }
@@ -1169,6 +1183,13 @@ function parseBlocks(src) {
       if (ind >= 4 && tip.t !== B_PARA) {
         // indented code (cannot interrupt a paragraph)
         if (tip.t !== B_CODE) {
+          // a code block cannot be a direct child of a list: close the
+          // list first so the code lands outside it (cm-257)
+          if (container.t === B_LIST) {
+            const l = closeTo(container.parent);
+            if (l) return { leftovers: l, retry: true };
+            container = container.parent;
+          }
           const code = addChild(container, newBlock(B_CODE, container));
           code.lines = [];
           tip = code;
@@ -1382,6 +1403,13 @@ function parseBlocks(src) {
     // tip is a container: start a new paragraph (unless the line is
     // empty after the container prefixes were stripped).  Restore the
     // last Phase 2 indentSave so the paragraph keeps its leading spaces.
+    // A paragraph can never be a direct child of a list: when the line
+    // does not belong to the list, close the list first (cm-255).
+    if (container.t === B_LIST) {
+      const l = closeTo(container.parent);
+      if (l) return { leftovers: l, retry: true };
+      container = container.parent;
+    }
     if (lastIndentSave) {
       cur.pos = lastIndentSave.pos; cur.col = lastIndentSave.col; cur.tab = lastIndentSave.tab;
     }
