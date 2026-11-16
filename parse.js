@@ -383,9 +383,13 @@ function htmlBlockType(cur) {
       // after '>' only spaces/tabs may follow for type 7; for type 6 the
       // tag name must be a block tag and the rest of the line is free
       if (BLOCK_TAGS.has(name)) return 6;
-      return 7;
+      // type 7: only spaces/tabs may follow the tag on this line
+      let e = m + 1;
+      while (e < n && (s.charCodeAt(e) === 32 || s.charCodeAt(e) === 9)) e++;
+      if (e >= n) return 7;
+      return 0;
     }
-    if (m >= n) return BLOCK_TAGS.has(name) ? 6 : 7;
+    if (m >= n) return BLOCK_TAGS.has(name) ? 6 : 0;
     return 0;
   }
   // type 1: pre, script, style, textarea (open tag only; the closing
@@ -1384,6 +1388,8 @@ function parseBlocks(src) {
     }
     if (tip.t === B_HTML) {
       tip.lines.push(curRest(cur));
+      // the block's trailing newline follows its last line's termination
+      tip.htmlAddNL = item.term;
       if (tip.hType !== 7 && tip.hType !== 6 && htmlBlockEnds(tip.hType, curRest(cur), tip.htmlName)) {
         // trailing newline only when this line was terminated and the
         // next line is not blank (cm-183)
@@ -1909,11 +1915,11 @@ function parseInline(text, refDefs) {
       } else {
         out.push({ t: 'softbreak' });
       }
-      // Spaces after the newline are content, never skipped: the block
-      // parser already stripped the line's indent, so what follows is
-      // part of the paragraph text (cm-049 keeps `    ***`, cm-241
-      // keeps a trailing space).
-      i = i + 1;
+      // Spaces after the newline are content for a soft break (never
+      // skipped: cm-049 keeps `    ***`, cm-241 keeps a trailing
+      // space), but a hard break drops the next line's leading spaces
+      // (cm-636: `foo  \n     bar` renders `foo<br>bar`).
+      i = hard ? k : i + 1;
       continue;
     }
 
@@ -2237,6 +2243,31 @@ function matchExtAutolink(s, i) {
     }
     return null;
   }
+  // mailto: / xmpp: (single colon, not ://) — the scheme is part of
+  // the link, plus the email and at most one /segment (gfm-633..635)
+  if (i < n && /[A-Za-z]/.test(s[i])) {
+    const low7 = s.slice(i, i + 7).toLowerCase();
+    let schemeLen = 0;
+    if (low7.startsWith('mailto:')) schemeLen = 7;
+    else if (s.slice(i, i + 5).toLowerCase() === 'xmpp:') schemeLen = 5;
+    if (schemeLen > 0) {
+      const emStart = i + schemeLen;
+      const emEnd = matchEmail(s, emStart);
+      if (emEnd > emStart) {
+        // trailing - _ + kills the link entirely
+        if (emEnd < n && (s[emEnd] === '-' || s[emEnd] === '_' || s[emEnd] === '+')) return null;
+        let end = emEnd;
+        if (end < n && s[end] === '/') {
+          let m = end + 1;
+          while (m < n && isUrlChar(s[m]) && s[m] !== '/') m++;
+          if (m > end + 1) end = m;
+        }
+        const cand = s.slice(i, end);
+        return { href: cand, text: cand, end };
+      }
+      return null;
+    }
+  }
   // scheme://
   if (i < n && /[A-Za-z]/.test(s[i])) {
     let k = i + 1;
@@ -2274,8 +2305,9 @@ function matchExtAutolink(s, i) {
   if (i < n && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[i])) {
     const emEnd = matchEmail(s, i);
     if (emEnd > i) {
-      // trailing - or _ kills the link entirely
-      if (emEnd < n && (s[emEnd] === '-' || s[emEnd] === '_')) return null;
+      // trailing - _ + kills the link entirely (gfm-631: the `+` after
+      // `hello@mail` means the address is cut off, so no link forms)
+      if (emEnd < n && (s[emEnd] === '-' || s[emEnd] === '_' || s[emEnd] === '+')) return null;
       const email = s.slice(i, emEnd);
       return { href: 'mailto:' + email, text: email, end: emEnd };
     }
@@ -2300,6 +2332,12 @@ function autolinkSplit(s) {
       // an email starts before the @; walk back over local-part chars
       let st = at;
       while (st > pos && /[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]/.test(s[st - 1])) st--;
+      // a mailto: / xmpp: scheme directly before the local part is
+      // part of the link (gfm-633..635) — but only if the scheme start
+      // is at or after pos, otherwise the candidate would start before
+      // pos and `pos = next + 1` would never advance (infinite loop)
+      if (st >= 7 && s.slice(st - 7, st).toLowerCase() === 'mailto:' && st - 7 >= pos) st -= 7;
+      else if (st >= 5 && s.slice(st - 5, st).toLowerCase() === 'xmpp:' && st - 5 >= pos) st -= 5;
       if (next < 0 || st < next) next = st;
     }
     if (next < 0) break;
@@ -2352,7 +2390,7 @@ function renderInlineNodes(nodes) {
       case 'text': out += escText(nd.s); break;
       case 'code': out += '<code>' + escCode(nd.s) + '</code>'; break;
       case 'softbreak': out += '\n'; break;
-      case 'hardbreak': out += '<br>\n'; break;
+      case 'hardbreak': out += '<br>'; break;
       case 'html': out += nd.s; break;
       case 'link':
         out += '<a href="' + encodeHref(nd.href) + '"';
@@ -2372,10 +2410,34 @@ function renderInlineNodes(nodes) {
   return out;
 }
 
+/* Merge literal delimiter runs (canOpen=false AND canClose=false) back
+   into plain text, so a word containing one stays a single text node.
+   Such a delimiter can never form emphasis, and without the merge an
+   email like `a.b-c_d@a.b` is split at the `_` and the autolink pass
+   only sees `d@a.b` (gfm-632). */
+function coalesceText(nodes) {
+  const out = [];
+  for (const nd of nodes) {
+    if (nd.t === 'text' && nd.delim && !nd.delim.canOpen && !nd.delim.canClose) {
+      const last = out[out.length - 1];
+      if (last && last.t === 'text' && !last.delim) last.s += nd.s;
+      else out.push(textNode(nd.s));
+    } else if (nd.t === 'text' && !nd.delim) {
+      const last = out[out.length - 1];
+      if (last && last.t === 'text' && !last.delim) last.s += nd.s;
+      else out.push(nd);
+    } else {
+      out.push(nd);
+    }
+  }
+  return out;
+}
+
 /* Full inline pipeline for one block's text: scan, extended autolinks,
    emphasis.  `state` carries the cross-paragraph inLink flag. */
 function renderInline(text, refDefs, state) {
-  const nodes = parseInline(text, refDefs);
+  let nodes = parseInline(text, refDefs);
+  nodes = coalesceText(nodes);
   extAutolinkPass(nodes, state);
   processEmphasisList(nodes);
   return renderInlineNodes(nodes);
