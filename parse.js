@@ -469,7 +469,14 @@ function setextLevel(cur) {
   while (i < s.length) {
     const c = s.charCodeAt(i);
     if (c === ch) { n++; i++; }
-    else if (c === 32 || c === 9) i++;
+    else if (c === 32 || c === 9) {
+      // a space ends the run: only trailing spaces may follow, so a
+      // further underline char after a space is not a setext underline
+      // (`= =`, `--- -` are paragraph text / thematic break, cm-088)
+      i++;
+      while (i < s.length && (s.charCodeAt(i) === 32 || s.charCodeAt(i) === 9)) i++;
+      return (i >= s.length && n >= 1) ? (ch === 61 ? 1 : 2) : 0;
+    }
     else return 0;
   }
   return n >= 1 ? (ch === 61 ? 1 : 2) : 0;
@@ -960,6 +967,8 @@ function parseBlocks(src) {
       return null;
     }
     if (b.t === B_CODE) {
+      // strip trailing blank lines
+      while (b.lines.length && b.lines[b.lines.length - 1] === '') b.lines.pop();
       b.text = b.lines.join('\n');
       if (b.lines.length) b.text += '\n';
       return null;
@@ -1084,6 +1093,13 @@ function parseBlocks(src) {
         tip.lines.push(curRest(cur));
         return null;
       }
+      // an indented code block continues across blank lines too (the
+      // blank line is part of the code; trailing blanks are stripped
+      // at finalize, cm-085)
+      if (tip.t === B_CODE) {
+        tip.lines.push('');
+        return null;
+      }
       // cm-241: a container-blank line (blank after a marker, raw not blank)
       // joins the paragraph when the tip is a paragraph in that blockquote
       // and the next line does not continue the blockquote.
@@ -1180,7 +1196,9 @@ function parseBlocks(src) {
           }
           const h = newBlock(B_H, tip.parent);
           h.lvl = sl;
-          h.text = r.rest;
+          // a setext heading's text drops the paragraph's leading
+          // spaces and trailing whitespace (cm-082, cm-084, cm-089)
+          h.text = r.rest.replace(/^[ \t]+/, '').replace(/[ \t\n]+$/, '');
           const p = tip.parent, idx = p.c.indexOf(tip);
           if (idx >= 0) p.c[idx] = h;
           tip = h;
@@ -1252,6 +1270,13 @@ function parseBlocks(src) {
         if (tip.t === B_PARA || tip.t === B_CODE) {
           const pl = closeTo(tip.parent);
           if (pl) return { leftovers: pl, retry: true };
+        }
+        // a thematic break cannot live inside a list: close the list
+        // first so the <hr> becomes a sibling of the list (cm-057)
+        if (container.t === B_LIST) {
+          const pl = closeTo(container.parent);
+          if (pl) return { leftovers: pl, retry: true };
+          container = container.parent;
         }
         addChild(container, newBlock(B_HR, container));
         tip = container;
@@ -1835,10 +1860,11 @@ function parseInline(text, refDefs) {
       } else {
         out.push({ t: 'softbreak' });
       }
-      // skip the spaces after the newline only when real content
-      // follows on that line; a line that is only spaces is content
-      // (cm-241: the trailing space of `> foo` / `>  ` is kept)
-      i = (k < n && text[k] !== '\n') ? k : i + 1;
+      // Spaces after the newline are content, never skipped: the block
+      // parser already stripped the line's indent, so what follows is
+      // part of the paragraph text (cm-049 keeps `    ***`, cm-241
+      // keeps a trailing space).
+      i = i + 1;
       continue;
     }
 
